@@ -1,13 +1,10 @@
 import json
 import logging
-from typing import Dict, Any, TypedDict
+from typing import Dict, Any, TypedDict, List, Optional
 from enum import Enum
-from typing import Union, Sequence
-import mcp.types as types
-from mcp.server import Server
+from mcp.server.fastmcp import FastMCP, Context
 from .pinecone import PineconeClient, PineconeRecord
-from .utils import MCPToolError
-from .chunking import create_chunker, Chunk
+from .chunking import create_chunker
 
 
 logger = logging.getLogger("pinecone-mcp")
@@ -21,267 +18,168 @@ class ToolName(str, Enum):
     PINECONE_STATS = "pinecone-stats"
 
 
-ServerTools = [
-    types.Tool(
-        name=ToolName.SEMANTIC_SEARCH,
-        description="Search pinecone for documents",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer", "default": 10},
-                "namespace": {
-                    "type": "string",
-                    "description": "Optional namespace to search in",
-                },
-                "category": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "date_range": {
-                    "type": "object",
-                    "properties": {
-                        "start": {"type": "string", "format": "date"},
-                        "end": {"type": "string", "format": "date"},
-                    },
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-    types.Tool(
-        name=ToolName.READ_DOCUMENT,
-        description="Read a document from pinecone",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "document_id": {"type": "string"},
-                "namespace": {
-                    "type": "string",
-                    "description": "Optional namespace to read from",
-                },
-            },
-            "required": ["document_id"],
-        },
-    ),
-    types.Tool(
-        name=ToolName.PROCESS_DOCUMENT,
-        description="Process a document. This will optionally chunk, then embed, and upsert the document into pinecone.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "document_id": {"type": "string"},
-                "text": {"type": "string"},
-                "metadata": {"type": "object"},
-                "namespace": {
-                    "type": "string",
-                    "description": "Optional namespace to store the document in",
-                },
-            },
-            "required": ["document_id", "text", "metadata"],
-        },
-    ),
-    types.Tool(
-        name=ToolName.LIST_DOCUMENTS,
-        description="List all documents in the knowledge base by namespace",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "namespace": {
-                    "type": "string",
-                    "description": "Namespace to list documents in",
-                }
-            },
-            "required": ["namespace"],
-        },
-    ),
-    types.Tool(
-        name=ToolName.PINECONE_STATS,
-        description="Get stats about the Pinecone index specified in this server",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    ),
-]
-
-
-def register_tools(server: Server, pinecone_client: PineconeClient):
-    @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
-        return ServerTools
-
-    @server.call_tool()
-    async def handle_call_tool(
-        name: str, arguments: dict | None
-    ) -> Sequence[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
+def register_tools(mcp: FastMCP, _: PineconeClient = None):
+    """
+    Register tools with the FastMCP instance
+    The pinecone client will be accessed from the Context
+    """
+    @mcp.tool(name=ToolName.SEMANTIC_SEARCH, description="Search pinecone for documents")
+    def semantic_search_tool(
+        ctx: Context,
+        query: str,
+        top_k: int = 10,
+        namespace: Optional[str] = None,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        date_range: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Search pinecone for documents"""
         try:
-            if name == ToolName.SEMANTIC_SEARCH:
-                return semantic_search(arguments, pinecone_client)
-            if name == ToolName.PINECONE_STATS:
-                return pinecone_stats(pinecone_client)
-            if name == ToolName.READ_DOCUMENT:
-                return read_document(arguments, pinecone_client)
-            if name == ToolName.PROCESS_DOCUMENT:
-                return process_document(arguments, pinecone_client)
-            if name == ToolName.LIST_DOCUMENTS:
-                return list_documents(arguments, pinecone_client)
+            pinecone_client = ctx.request_context.lifespan_context.pinecone
+            filters = {}
+            
+            if category:
+                filters["category"] = category
+            if tags:
+                filters["tags"] = {"$in": tags}
+            if date_range and "start" in date_range and "end" in date_range:
+                filters["date"] = {
+                    "$gte": date_range["start"],
+                    "$lte": date_range["end"],
+                }
+            
+            results = pinecone_client.search_records(
+                query=query,
+                top_k=top_k,
+                filter=filters,
+                include_metadata=True,
+                namespace=namespace,
+            )
+            
+            matches = results.get("matches", [])
 
+            # Format results with rich context
+            formatted_text = "Retrieved Contexts:\n\n"
+            for i, match in enumerate(matches, 1):
+                metadata = match.get("metadata", {})
+                formatted_text += f"Result {i} | Similarity: {match['score']:.3f} | Document ID: {match['id']}\n"
+                formatted_text += f"{metadata.get('text', '').strip()}\n"
+                formatted_text += "-" * 10 + "\n\n"
+                
+            return {"type": "text", "text": formatted_text}
         except Exception as e:
-            logger.error(f"Error calling tool {name}: {e}")
-            raise
-
-
-def list_documents(
-    arguments: dict | None, pinecone_client: PineconeClient
-) -> list[types.TextContent]:
-    """
-    List all documents in the knowledge base by namespace
-    """
-    namespace = arguments.get("namespace")
-    results = pinecone_client.list_records(namespace=namespace)
-    return [types.TextContent(type="text", text=json.dumps(results))]
-
-
-def pinecone_stats(pinecone_client: PineconeClient) -> list[types.TextContent]:
-    """
-    Get stats about the Pinecone index specified in this server
-    """
-    stats = pinecone_client.stats()
-    return [types.TextContent(type="text", text=json.dumps(stats))]
-
-
-def semantic_search(
-    arguments: dict | None, pinecone_client: PineconeClient
-) -> list[types.TextContent]:
-    """
-    Read a document from the pinecone knowledge base
-    """
-    query = arguments.get("query")
-    top_k = arguments.get("top_k", 10)
-    filters = arguments.get("filters", {})
-    namespace = arguments.get("namespace")
-
-    results = pinecone_client.search_records(
-        query=query,
-        top_k=top_k,
-        filter=filters,
-        include_metadata=True,
-        namespace=namespace,
-    )
-
-    matches = results.get("matches", [])
-
-    # Format results with rich context
-    formatted_text = "Retrieved Contexts:\n\n"
-    for i, match in enumerate(matches, 1):
-        metadata = match.get("metadata", {})
-        formatted_text += f"Result {i} | Similarity: {match['score']:.3f} | Document ID: {match['id']}\n"
-        formatted_text += f"{metadata.get('text', '').strip()}\n"
-        formatted_text += "-" * 10 + "\n\n"
-
-    return [types.TextContent(type="text", text=formatted_text)]
-
-
-def process_document(
-    arguments: dict | None, pinecone_client: PineconeClient
-) -> list[types.TextContent]:
-    """
-    Process a document by chunking, embedding, and upserting it into the knowledge base. Returns the document ID.
-    """
-    document_id = arguments.get("document_id")
-    text = arguments.get("text")
-    namespace = arguments.get("namespace")
-    metadata = arguments.get("metadata", {})
-
-    chunker = create_chunker(chunk_type="smart")
-    chunks = chunker.chunk_document(document_id, text, metadata)
-
-    embed_result = embed_document(chunks, pinecone_client)
-
-    embedded_chunks = embed_result.get("embedded_chunks", None)
-
-    if embedded_chunks is None:
-        raise MCPToolError("No embedded chunks found")
-
-    upsert_documents(embedded_chunks, pinecone_client, namespace)
-
-    return [
-        types.TextContent(
-            type="text",
-            text=f"Successfully processed document. The document ID is {document_id}",
-        )
-    ]
+            logger.error(f"Error in semantic search: {e}")
+            return {"type": "text", "text": f"Error: {str(e)}"}
+            
+    @mcp.tool(name=ToolName.PINECONE_STATS, description="Get stats about the Pinecone index specified in this server")
+    def pinecone_stats_tool(ctx: Context) -> Dict[str, Any]:
+        """Get stats about the Pinecone index specified in this server"""
+        try:
+            pinecone_client = ctx.request_context.lifespan_context.pinecone
+            stats = pinecone_client.stats()
+            return {"type": "text", "text": json.dumps(stats)}
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            return {"type": "text", "text": f"Error: {str(e)}"}
+            
+    @mcp.tool(name=ToolName.READ_DOCUMENT, description="Read a document from pinecone")
+    def read_document_tool(
+        ctx: Context,
+        document_id: str,
+        namespace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read a document from pinecone"""
+        try:
+            pinecone_client = ctx.request_context.lifespan_context.pinecone
+            record = pinecone_client.fetch_records([document_id], namespace=namespace)
+            
+            # Get the vector data for this document
+            vector = record.vectors.get(document_id)
+            if not vector:
+                return {"type": "text", "text": f"Document {document_id} not found"}
+                
+            # Get metadata from the vector
+            metadata = vector.metadata if hasattr(vector, "metadata") else {}
+            
+            # Format the document content
+            formatted_content = []
+            formatted_content.append(f"Document ID: {document_id}")
+            formatted_content.append("")  # Empty line for spacing
+            
+            if metadata:
+                formatted_content.append("Metadata:")
+                for key, value in metadata.items():
+                    formatted_content.append(f"{key}: {value}")
+                    
+            return {"type": "text", "text": "\n".join(formatted_content)}
+        except Exception as e:
+            logger.error(f"Error reading document: {e}")
+            return {"type": "text", "text": f"Error: {str(e)}"}
+            
+    @mcp.tool(name=ToolName.PROCESS_DOCUMENT, description="Process a document. This will optionally chunk, then embed, and upsert the document into pinecone.")
+    def process_document_tool(
+        ctx: Context,
+        document_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        namespace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Process a document by chunking, embedding, and upserting it into pinecone"""
+        try:
+            pinecone_client = ctx.request_context.lifespan_context.pinecone
+            chunker = create_chunker(chunk_type="smart")
+            chunks = chunker.chunk_document(document_id, text, metadata)
+            
+            embedded_chunks = []
+            for chunk in chunks:
+                content = chunk.content
+                chunk_id = chunk.id
+                chunk_metadata = chunk.metadata
+                
+                if not content or not chunk_id:
+                    logger.warning(f"Skipping invalid chunk: {chunk}")
+                    continue
+                    
+                embedding = pinecone_client.generate_embeddings(content)
+                record = PineconeRecord(
+                    id=chunk_id,
+                    embedding=embedding,
+                    text=content,
+                    metadata=chunk_metadata,
+                )
+                embedded_chunks.append(record)
+                
+            if not embedded_chunks:
+                return {"type": "text", "text": "Error: No embedded chunks found"}
+                
+            pinecone_client.upsert_records(embedded_chunks, namespace=namespace)
+            
+            return {
+                "type": "text",
+                "text": f"Successfully processed document. The document ID is {document_id}"
+            }
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            return {"type": "text", "text": f"Error: {str(e)}"}
+            
+    @mcp.tool(name=ToolName.LIST_DOCUMENTS, description="List all documents in the knowledge base by namespace")
+    def list_documents_tool(
+        ctx: Context,
+        namespace: str,
+    ) -> Dict[str, Any]:
+        """List all documents in the knowledge base by namespace"""
+        try:
+            pinecone_client = ctx.request_context.lifespan_context.pinecone
+            results = pinecone_client.list_records(namespace=namespace)
+            return {"type": "text", "text": json.dumps(results)}
+        except Exception as e:
+            logger.error(f"Error listing documents: {e}")
+            return {"type": "text", "text": f"Error: {str(e)}"}
 
 
 class EmbeddingResult(TypedDict):
     embedded_chunks: list[PineconeRecord]
     total_embedded: int
-
-
-def embed_document(
-    chunks: list[Chunk], pinecone_client: PineconeClient
-) -> EmbeddingResult:
-    """
-    Embed a list of chunks.
-    Uses the Pinecone client to generate embeddings with the inference API.
-    """
-    embedded_chunks = []
-    for chunk in chunks:
-        content = chunk.content
-        chunk_id = chunk.id
-        metadata = chunk.metadata
-
-        if not content or not chunk_id:
-            logger.warning(f"Skipping invalid chunk: {chunk}")
-            continue
-
-        embedding = pinecone_client.generate_embeddings(content)
-        record = PineconeRecord(
-            id=chunk_id,
-            embedding=embedding,
-            text=content,
-            metadata=metadata,
-        )
-        embedded_chunks.append(record)
-    return EmbeddingResult(
-        embedded_chunks=embedded_chunks,
-        total_embedded=len(embedded_chunks),
-    )
-
-
-def read_document(
-    arguments: dict | None, pinecone_client: PineconeClient
-) -> list[types.TextContent]:
-    """
-    Read a single Pinecone document by ID
-    """
-    document_id = arguments.get("document_id")
-    namespace = arguments.get("namespace")
-    if not document_id:
-        raise ValueError("document_id is required")
-
-    # Fetch the record using your existing fetch_records method
-    record = pinecone_client.fetch_records([document_id], namespace=namespace)
-
-    # Get the vector data for this document
-    vector = record.vectors.get(document_id)
-    if not vector:
-        raise ValueError(f"Document {document_id} not found")
-
-    # Get metadata from the vector
-    metadata = vector.metadata if hasattr(vector, "metadata") else {}
-
-    # Format the document content
-    formatted_content = []
-    formatted_content.append(f"Document ID: {document_id}")
-    formatted_content.append("")  # Empty line for spacing
-
-    if metadata:
-        formatted_content.append("Metadata:")
-        for key, value in metadata.items():
-            formatted_content.append(f"{key}: {value}")
-
-    return [types.TextContent(type="text", text="\n".join(formatted_content))]
 
 
 def upsert_documents(
