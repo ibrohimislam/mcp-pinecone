@@ -116,15 +116,18 @@ def register_tools(mcp: FastMCP, _: PineconeClient = None):
             logger.error(f"Error reading document: {e}")
             return {"type": "text", "text": f"Error: {str(e)}"}
             
-    @mcp.tool(name=ToolName.STORE_DOCUMENT, description="Store a document. This will optionally chunk, then embed, and upsert the document into pinecone.")
+    @mcp.tool(name=ToolName.STORE_DOCUMENT, description="Store a document, it will automatically upsert the document into pinecone")
     def store_document_tool(
         ctx: Context,
         document_id: str,
         text: str,
-        metadata: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
         namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store a document by chunking, embedding, and upserting it into pinecone"""
+        if metadata == None:
+            metadata = {}
+
         try:
             pinecone_client = ctx.request_context.lifespan_context.pinecone
             chunker = create_chunker(chunk_type="smart")
