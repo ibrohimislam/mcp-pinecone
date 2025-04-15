@@ -13,7 +13,7 @@ logger = logging.getLogger("pinecone-mcp")
 class ToolName(str, Enum):
     SEMANTIC_SEARCH = "semantic-search"
     READ_DOCUMENT = "read-document"
-    PROCESS_DOCUMENT = "process-document"
+    STORE_DOCUMENT = "store-document"
     LIST_DOCUMENTS = "list-documents"
     PINECONE_STATS = "pinecone-stats"
 
@@ -116,15 +116,15 @@ def register_tools(mcp: FastMCP, _: PineconeClient = None):
             logger.error(f"Error reading document: {e}")
             return {"type": "text", "text": f"Error: {str(e)}"}
             
-    @mcp.tool(name=ToolName.PROCESS_DOCUMENT, description="Process a document. This will optionally chunk, then embed, and upsert the document into pinecone.")
-    def process_document_tool(
+    @mcp.tool(name=ToolName.STORE_DOCUMENT, description="Store a document. This will optionally chunk, then embed, and upsert the document into pinecone.")
+    def store_document_tool(
         ctx: Context,
         document_id: str,
         text: str,
         metadata: Dict[str, Any],
         namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Process a document by chunking, embedding, and upserting it into pinecone"""
+        """Store a document by chunking, embedding, and upserting it into pinecone"""
         try:
             pinecone_client = ctx.request_context.lifespan_context.pinecone
             chunker = create_chunker(chunk_type="smart")
